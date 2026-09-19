@@ -28,40 +28,59 @@ import {
   companyRoleDedupKey,
   isDistinctRequisition,
   requisitionIdForDedup,
+  requisitionIdsForDedup,
 } from '../scan.mjs';
 
 console.log('\nscan.mjs — requisition-aware company+role dedupe');
 
 const WD = 'https://ubc.wd10.myworkdayjobs.com/ubcstaffjobs/job/UBC-Vancouver-Campus---Vancouver-BC-Canada';
-const trackerWith = (notes) => `# Applications Tracker
+const trackerWith = (notes, { company = 'UBC', role = 'Programmer Analyst I' } = {}) => `# Applications Tracker
 
 | # | Date | Company | Role | Score | Status | PDF | Report | Notes |
 |---|------|---------|------|-------|--------|-----|--------|-------|
-| 1 | 2026-09-14 | UBC | Programmer Analyst I | 4.2/5 | Applied | ✅ | [001](../reports/001-ubc-2026-09-14.md) | ${notes} |
+| 1 | 2026-09-14 | ${company} | ${role} | 4.2/5 | Applied | ✅ | [001](../reports/001-ubc-2026-09-14.md) | ${notes} |
 `;
 
 // ── 1. Requisition parse ─────────────────────────────────────────────────────
+// Each case lists EVERY form the source may name. One form when the source is
+// known (a Workday URL strips the -N repost suffix, a non-Workday URL keeps the
+// label whole); both forms when only a labelled note is available, so the
+// decision never has to guess which board the note came from.
 {
   const cases = [
-    [{ url: `${WD}/Programmer-Analyst-I_JR25853` }, '25853', 'Workday URL tail'],
-    [{ url: `${WD}/Development-Coordinator--Library_JR25830-1` }, '25830', 'Workday -N repost suffix is the same requisition'],
-    [{ text: 'req JR25919; Deadline 2026-09-17' }, '25919', 'labelled tracker note'],
-    [{ text: 'JR25919 one-year term' }, '25919', 'bare JR label'],
-    [{ url: 'https://job-boards.greenhouse.io/acme/jobs/4244715009' }, null, 'generic board posting id is not a requisition'],
-    [{ text: 'remote Canada; base CAD 140K' }, null, 'unlabelled note'],
+    [{ url: `${WD}/Programmer-Analyst-I_JR25853` }, ['25853'], 'Workday URL tail'],
+    [{ url: `${WD}/Development-Coordinator--Library_JR25830-1` }, ['25830'], 'Workday -N repost suffix is the same requisition'],
+    [{ text: 'req JR25919; Deadline 2026-09-17' }, ['25919'], 'labelled tracker note'],
+    [{ text: 'JR25919 one-year term' }, ['25919'], 'bare JR label'],
+    [{ text: 'req JR25919-1; applied' }, ['259191', '25919'], 'no URL: a copied -N tail yields both forms, so it still meets the Workday URL (PR #4267 review)'],
+    [{ text: 'req ABC123-1' }, ['1231', '123'], 'no URL: a short -N suffix yields both forms, so it still meets a Lever title (PR #4267 review)'],
+    [{ text: 'req ABC123-1', url: 'https://jobs.lever.co/acme/a1' }, ['1231'], 'known non-Workday URL keeps the -N suffix (it is part of the ID)'],
+    [{ text: 'req ABC123-2', url: 'https://jobs.lever.co/acme/a2' }, ['1232'], 'known non-Workday URL: the sibling ID stays distinct'],
+    [{ text: 'req R-2593225' }, ['2593225'], 'hyphenated non-Workday ID is one form even without a URL'],
+    [{ url: 'https://careers.walmart.com/us/en/job/R-2593225' }, [], 'non-Workday URL is not parsed as a requisition'],
+    [{ url: 'https://job-boards.greenhouse.io/acme/jobs/4244715009' }, [], 'generic board posting id is not a requisition'],
+    [{ text: 'remote Canada; base CAD 140K' }, [], 'unlabelled note'],
   ];
   for (const [input, want, label] of cases) {
-    const got = requisitionIdForDedup(input);
-    if (got === want) pass(`requisitionIdForDedup: ${label}`);
-    else fail(`requisitionIdForDedup: ${label} — got ${JSON.stringify(got)}, want ${JSON.stringify(want)}`);
+    const got = requisitionIdsForDedup(input);
+    if (JSON.stringify(got) === JSON.stringify(want)) pass(`requisitionIdsForDedup: ${label}`);
+    else fail(`requisitionIdsForDedup: ${label} — got ${JSON.stringify(got)}, want ${JSON.stringify(want)}`);
   }
+  const single = requisitionIdForDedup({ text: 'req JR25919-1' });
+  if (single === '259191') pass('requisitionIdForDedup: returns the as-labelled form first');
+  else fail(`requisitionIdForDedup: got ${JSON.stringify(single)}, want "259191"`);
 }
 
 // ── 2. Decision is conservative ──────────────────────────────────────────────
 {
   const checks = [
-    [new Set(['25919']), '25853', true, 'different labelled requisition is distinct'],
-    [new Set(['25919']), '25919', false, 'same requisition is a duplicate'],
+    [new Set(['25919']), ['25853'], true, 'different labelled requisition is distinct'],
+    [new Set(['1231']), ['1232'], true, 'non-Workday ABC123-1 vs ABC123-2 stay distinct requisitions'],
+    [new Set(['25919']), ['25919'], false, 'same requisition is a duplicate'],
+    [new Set(['259191', '25919']), ['25919'], false, 'ambiguous note seeded both forms: the Workday URL form hits one'],
+    [new Set(['1231', '123']), ['1231'], false, 'ambiguous note seeded both forms: the Lever title form hits one'],
+    [new Set(['1231', '123']), ['1232'], true, 'ambiguous note seeded both forms: the Lever sibling hits neither'],
+    [new Set(['25919']), '25919', false, 'a bare string candidate is still accepted'],
     [new Set(['25919', ANY_REQUISITION]), '25853', false, 'an unlabelled seed keeps the duplicate'],
     [new Set(['25919']), null, false, 'an unlabelled candidate keeps the duplicate'],
     [undefined, '25853', false, 'no seed data keeps the duplicate'],
@@ -81,6 +100,8 @@ const trackerWith = (notes) => `# Applications Tracker
     scanHistoryText: `url\tfirst_seen\tportal\ttitle\tcompany\tstatus\tlocation\n${WD}/Programmer-Analyst-I_JR25919\t2026-09-14\tUBC\tProgrammer Analyst I\tUBC\tadded\tVancouver\n`,
   }, {}, undefined, { requisitionsByBase });
   const seeded = requisitionsByBase.get(companyRoleDedupKey('UBC', 'Programmer Analyst I'));
+  // The note has no -N suffix, so it contributes one form — the same one the
+  // two URLs contribute.
   if (seeded && seeded.size === 1 && seeded.has('25919')) {
     pass('collectSeenCompanyRoles: tracker note, pipeline URL and scan-history URL all seed the same requisition');
   } else {
@@ -88,12 +109,40 @@ const trackerWith = (notes) => `# Applications Tracker
   }
 }
 
+// ── 3b. A tracker with a URL column passes the URL through ───────────────────
+{
+  const requisitionsByBase = new Map();
+  collectSeenCompanyRoles({
+    applicationsText: `# Applications Tracker
+
+| # | Date | Company | Role | Score | Status | PDF | Report | Notes | URL |
+|---|------|---------|------|-------|--------|-----|--------|-------|-----|
+| 1 | 2026-09-14 | Acme | Engineer | 4.0/5 | Applied | ✅ | [001](../reports/001-acme-2026-09-14.md) | req ABC123-1 | https://jobs.lever.co/acme/a1 |
+`,
+  }, {}, undefined, { requisitionsByBase });
+  const seeded = requisitionsByBase.get(companyRoleDedupKey('Acme', 'Engineer'));
+  if (seeded && seeded.size === 1 && seeded.has('1231')) {
+    pass('collectSeenCompanyRoles: a tracker URL column reaches the parser, so a Lever row keeps ABC123-1 whole');
+  } else {
+    fail(`collectSeenCompanyRoles (URL column) seeded [${seeded ? [...seeded].join(', ') : 'nothing'}], want [1231]`);
+  }
+}
+
 // ── 4. END-TO-END: two scan runs over the two-requisition board ─────────────
-function runScanTwice(trackerNotes) {
+const UBC_BOARD = {
+  company: 'UBC', role: 'Programmer Analyst I', titleFilter: 'Programmer Analyst',
+  careersUrl: 'https://ubc.wd10.myworkdayjobs.com/ubcstaffjobs', script: 'tests/fixtures/two-requisition-board.mjs',
+};
+const LEVER_BOARD = {
+  company: 'Acme', role: 'Engineer - req ABC123-1', titleFilter: 'Engineer',
+  careersUrl: 'https://jobs.lever.co/acme', script: 'tests/fixtures/lever-suffixed-requisitions-board.mjs',
+};
+
+function runScanTwice(trackerNotes, board = UBC_BOARD) {
   const dir = mkdtempSync(join(tmpdir(), 'scan-reqdedup-e2e-'));
   try {
     mkdirSync(join(dir, 'data'), { recursive: true });
-    writeFileSync(join(dir, 'data', 'applications.md'), trackerWith(trackerNotes));
+    writeFileSync(join(dir, 'data', 'applications.md'), trackerWith(trackerNotes, board));
     writeFileSync(join(dir, 'data', 'pipeline.md'), '# Pipeline\n\n');
 
     const portals = join(dir, 'portals.yml');
@@ -101,13 +150,13 @@ function runScanTwice(trackerNotes) {
   dedup_include_location: true
 title_filter:
   positive:
-    - "Programmer Analyst"
+    - "${board.titleFilter}"
 tracked_companies:
-  - name: UBC
-    careers_url: https://ubc.wd10.myworkdayjobs.com/ubcstaffjobs
+  - name: ${board.company}
+    careers_url: ${board.careersUrl}
     parser:
       command: node
-      script: tests/fixtures/two-requisition-board.mjs
+      script: ${board.script}
 `);
 
     const scan = () => execFileSync(NODE, [join(ROOT, 'scan.mjs')], {
@@ -142,6 +191,40 @@ tracked_companies:
     }
   } catch (err) {
     fail(`e2e scan run (labelled tracker) failed: ${err.message}`);
+  }
+}
+
+{
+  // Mixed representations of one requisition: the note carries Workday's -N
+  // repost suffix, the board URL does not. Before the suffix rule was shared,
+  // the note read as a third requisition and the applied JR25919 was re-queued.
+  try {
+    const { afterFirst, afterSecond } = runScanTwice('req JR25919-1; applied');
+    if (afterFirst.length === 1 && afterFirst[0].includes('_JR25853') && afterSecond.length === 1) {
+      pass('e2e: a note with the -N repost suffix still recognises the applied requisition, only JR25853 queued');
+    } else {
+      fail(`e2e -N suffix note: run 1 ${JSON.stringify(afterFirst)}, run 2 has ${afterSecond.length} (want only JR25853, once)`);
+    }
+  } catch (err) {
+    fail(`e2e scan run (-N suffix note) failed: ${err.message}`);
+  }
+}
+
+{
+  // The other half of the same ambiguity, on a board where the -N suffix is
+  // part of the ID. The tracker note names `req ABC123-1` with no URL column;
+  // the Lever posting's own form is `1231`. Guessing the Workday reading
+  // (`123`) for the note made the applied posting look distinct and re-queued
+  // it; carrying both forms recognises it, and only ABC123-2 is queued.
+  try {
+    const { afterFirst, afterSecond } = runScanTwice('req ABC123-1; applied', LEVER_BOARD);
+    if (afterFirst.length === 1 && afterFirst[0].includes('/acme/a2') && afterSecond.length === 1) {
+      pass('e2e: a no-URL note with a short -N suffix still recognises the applied Lever posting, only ABC123-2 queued');
+    } else {
+      fail(`e2e no-URL note vs Lever: run 1 ${JSON.stringify(afterFirst)}, run 2 has ${afterSecond.length} (want only /acme/a2, once)`);
+    }
+  } catch (err) {
+    fail(`e2e scan run (no-URL note vs Lever) failed: ${err.message}`);
   }
 }
 

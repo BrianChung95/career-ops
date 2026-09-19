@@ -306,6 +306,7 @@ export function parseTrackerRow(line, colmap = LEGACY_COLMAP) {
   };
   if (colmap.location != null) row.location = at('location');
   if (colmap.via != null) row.via = at('via');
+  if (colmap.url != null) row.url = at('url');
   return row;
 }
 

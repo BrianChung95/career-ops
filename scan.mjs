@@ -65,7 +65,7 @@ import { mergeProviderPlugins } from './plugins/_engine.mjs';
 import { classifyFetchError } from './verify-portals.mjs';
 import { fingerprintText, findCrossListings } from './fingerprint-core.mjs';
 import { resolveColumns, parseTrackerRow, normalizeTextKey, extractReqNumber } from './tracker-parse.mjs';
-import { workdayDedupKey } from './providers/workday.mjs';
+import { workdayDedupKey, stripWorkdayRepostSuffix, isWorkdayJobUrl } from './providers/workday.mjs';
 import { normalizeCompany } from './tracker-utils.mjs';
 import { normalizeCompanyName } from './invite-match.mjs';
 import { withPipelineLock } from './pipeline-lock.mjs';
@@ -1949,7 +1949,8 @@ export function companyRoleDedupKey(company, role, canonicalize = defaultCompany
 export const ANY_REQUISITION = '*';
 
 /**
- * Canonical requisition ID for company+role dedupe, or null when none is known.
+ * Canonical requisition IDs for company+role dedupe — every form the source
+ * could name; empty when none is known.
  *
  * Two same-titled postings at one employer are not always one role: UBC ran two
  * "Programmer Analyst I" requisitions at once (JR25919 and JR25853, different
@@ -1966,21 +1967,68 @@ export const ANY_REQUISITION = '*';
  * read: a repost gets a new one, and treating it as a requisition would disable
  * the company+role key it is layered on.
  *
- * The result is uppercased, stripped of punctuation and of a leading letter
+ * A labelled ID with a trailing `-N` is ambiguous. On Workday the suffix is a
+ * cross-site repost disambiguator and `JR25919-1` IS JR25919 (the URL path
+ * strips it via `workdayDedupKey`); on Lever or Greenhouse `ABC123-1` and
+ * `ABC123-2` are two requisitions. The source decides how many forms come
+ * back:
+ *
+ * - Workday URL: one form, the suffix stripped.
+ * - Known non-Workday URL: one form, the label kept whole.
+ * - No URL (a tracker note on a layout without a URL column): BOTH forms, as
+ *   labelled and suffix-stripped. Nothing is guessed. A seeded row records
+ *   every form and a candidate is distinct only when NONE of its forms was
+ *   seen, so the ambiguous note matches whichever board the posting turns out
+ *   to live on: note `req JR25919-1` recognises Workday `_JR25919`, and note
+ *   `req ABC123-1` recognises a Lever title carrying `req ABC123-1` (whose
+ *   own single form is `1231`, not `123`), so neither applied posting is
+ *   re-queued. Guessing one form was wrong in both directions: stripping
+ *   collapsed `123` against Lever's `1231` (re-queued), keeping it left
+ *   `259191` against Workday's `25919` (also re-queued).
+ *
+ * The suffix rule (`stripWorkdayRepostSuffix`) only fires when the part before
+ * the hyphen is already requisition-shaped, so Walmart's `R-2593225` is one
+ * form on every path.
+ *
+ * Every form is uppercased, stripped of punctuation and of a leading letter
  * prefix, so `req JR25919` in a note, a bare `JR25919` (whose `jr` is itself the
  * label) and the URL tail `_JR25919` all compare equal.
  *
  * @param {{url?: unknown, text?: unknown}} [source] - Posting URL and/or free text.
- * @returns {string|null} Canonical requisition ID.
+ * @returns {string[]} Canonical requisition IDs, as-labelled form first.
  */
-export function requisitionIdForDedup({ url, text } = {}) {
+export function requisitionIdsForDedup({ url, text } = {}) {
   const workdayKey = typeof url === 'string' ? workdayDedupKey({ url }) : null;
-  // `workday:{hostname}:{reqId}` — a hostname has no colon, so the ID is
-  // everything after the second one.
-  const raw = workdayKey ? workdayKey.split(':').slice(2).join(':') : extractReqNumber(text);
-  if (!raw) return null;
-  const id = String(raw).toUpperCase().replace(/[^A-Z0-9]/g, '').replace(/^[A-Z]+(?=\d)/, '');
-  return /\d/.test(id) ? id : null;
+  let raws;
+  if (workdayKey) {
+    // `workday:{hostname}:{reqId}` — a hostname has no colon, so the ID is
+    // everything after the second one.
+    raws = [workdayKey.split(':').slice(2).join(':')];
+  } else {
+    const labelled = extractReqNumber(text);
+    if (!labelled) return [];
+    raws = isWorkdayJobUrl(url) === false
+      ? [labelled]
+      : [labelled, stripWorkdayRepostSuffix(labelled)];
+  }
+  const forms = [];
+  for (const raw of raws) {
+    const id = String(raw ?? '').toUpperCase().replace(/[^A-Z0-9]/g, '').replace(/^[A-Z]+(?=\d)/, '');
+    if (/\d/.test(id) && !forms.includes(id)) forms.push(id);
+  }
+  return forms;
+}
+
+/**
+ * The source's requisition ID as labelled — the first form of
+ * {@link requisitionIdsForDedup} — or null. A convenience for callers that
+ * want one ID to print; the dedupe decision itself compares every form.
+ *
+ * @param {{url?: unknown, text?: unknown}} [source]
+ * @returns {string|null}
+ */
+export function requisitionIdForDedup(source) {
+  return requisitionIdsForDedup(source)[0] ?? null;
 }
 
 /**
@@ -1988,26 +2036,36 @@ export function requisitionIdForDedup({ url, text } = {}) {
  * different requisition.
  *
  * True only when every seeded row for the key named its requisition and none of
- * them is the candidate's. Any unknown on either side keeps the historical
- * answer — a duplicate — so the check can only let through postings the
- * company itself labelled as distinct.
+ * the candidate's forms was seen. Any unknown on either side keeps the
+ * historical answer — a duplicate — so the check can only let through postings
+ * the company itself labelled as distinct. An ambiguous source contributes
+ * every form it could mean (see {@link requisitionIdsForDedup}), and one hit
+ * on any of them is a duplicate.
  *
  * @param {Set<string>|undefined} seededRequisitions - Requisitions seen for the bare key.
- * @param {string|null} candidateRequisition - From {@link requisitionIdForDedup}.
+ * @param {string[]|string|null} candidateRequisitions - From {@link requisitionIdsForDedup}.
  * @returns {boolean}
  */
-export function isDistinctRequisition(seededRequisitions, candidateRequisition) {
-  return Boolean(candidateRequisition)
+export function isDistinctRequisition(seededRequisitions, candidateRequisitions) {
+  const forms = toRequisitionForms(candidateRequisitions);
+  return forms.length > 0
     && seededRequisitions instanceof Set
     && seededRequisitions.size > 0
     && !seededRequisitions.has(ANY_REQUISITION)
-    && !seededRequisitions.has(candidateRequisition);
+    && forms.every(form => !seededRequisitions.has(form));
 }
 
-function recordRequisition(requisitionsByBase, baseKey, requisition) {
+function toRequisitionForms(requisitions) {
+  if (Array.isArray(requisitions)) return requisitions.filter(Boolean);
+  return requisitions ? [requisitions] : [];
+}
+
+function recordRequisition(requisitionsByBase, baseKey, requisitions) {
   let seen = requisitionsByBase.get(baseKey);
   if (!seen) requisitionsByBase.set(baseKey, (seen = new Set()));
-  seen.add(requisition || ANY_REQUISITION);
+  const forms = toRequisitionForms(requisitions);
+  if (forms.length === 0) seen.add(ANY_REQUISITION);
+  for (const form of forms) seen.add(form);
 }
 
 /**
@@ -2094,7 +2152,7 @@ export function collectSeenCompanyRoles(sources = {}, policy = {}, canonicalize 
     for (const line of lines) {
       const row = parseTrackerRow(line, colmap);
       if (!row) continue;
-      add(row.company, row.role, row.location, requisitionIdForDedup({ text: row.notes }));
+      add(row.company, row.role, row.location, requisitionIdsForDedup({ url: row.url, text: row.notes }));
     }
   }
 
@@ -2106,7 +2164,7 @@ export function collectSeenCompanyRoles(sources = {}, policy = {}, canonicalize 
     if (!url) continue;
     if (status !== 'added') continue;
     if (!shouldDedupScanHistoryRow({ firstSeen, status }, policy)) continue;
-    add(company, title, location, requisitionIdForDedup({ url }));
+    add(company, title, location, requisitionIdsForDedup({ url }));
   }
 
   // pipeline.md — company/title are the two cells after the URL cell, plus
@@ -2117,7 +2175,7 @@ export function collectSeenCompanyRoles(sources = {}, policy = {}, canonicalize 
   // wrong cells, so the seen-set keyed on garbage.
   for (const line of pipelineText.split('\n')) {
     const pair = extractPipelineCompanyRole(line);
-    if (pair) add(pair.company, pair.role, pair.location, requisitionIdForDedup({ url: pair.url }));
+    if (pair) add(pair.company, pair.role, pair.location, requisitionIdsForDedup({ url: pair.url }));
   }
 
   return seen;
@@ -3280,7 +3338,7 @@ async function main() {
           : (dedupIncludeLocation
             ? companyRoleDedupKey(job.company, job.title, canonicalizeCompany, job.location)
             : baseKey);
-        const requisition = requisitionIdForDedup({ url: job.url, text: job.title });
+        const requisition = requisitionIdsForDedup({ url: job.url, text: job.title });
         if (
           key !== null && (
             seenCompanyRoles.has(key) ||
