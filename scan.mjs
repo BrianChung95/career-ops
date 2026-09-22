@@ -2041,7 +2041,10 @@ export const ANY_REQUISITION = '*';
  *
  * Comparison ignores case only: prefixes and punctuation identify distinct
  * requisitions. Bare JR/R_ tokens retain the prefix consumed as a label by
- * the shared tracker parser.
+ * the shared tracker parser, including label separators such as `JR: 25919`.
+ * Glued punctuation (`JR-25919`) remains part of the identifier. Numeric-only
+ * text (`Req #25919`) may omit a prefix, so it supplies no proof of a distinct
+ * requisition. A numeric ID extracted from a Workday URL is authoritative.
  *
  * @param {{url?: unknown, text?: unknown}} [source] - Posting URL and/or free text.
  * @returns {string[]} Canonical requisition IDs, as-labelled form first.
@@ -2055,10 +2058,14 @@ export function requisitionIdsForDedup({ url, text } = {}) {
     raws = [workdayKey.split(':').slice(2).join(':')];
   } else {
     const match = String(text ?? '').match(REQ_NUMBER_RE);
-    const labelled = match && /^(?:JR-?|R_)\d/i.test(match[0])
+    const separatedPrefix = match?.[0].match(/^(JR|R_)[\s:#]+/i);
+    const labelled = match && /^(?:JR[-_]?|R_)\d/i.test(match[0])
       ? match[0].toUpperCase()
-      : extractReqNumber(text);
+      : separatedPrefix && /^\d/.test(match[1])
+        ? `${separatedPrefix[1]}${match[1]}`.toUpperCase()
+        : extractReqNumber(text);
     if (!labelled) return [];
+    if (/^[\d-]+$/.test(labelled)) return [];
     const workdayUrl = isWorkdayJobUrl(url);
     raws = workdayUrl === true
       ? [stripWorkdayRepostSuffix(labelled)]
@@ -2518,9 +2525,8 @@ export function loadDedupSnapshot(policy = {}, canonicalize = defaultCompanyNorm
   const pipelineText = readIfExists(pipelinePath);
   const applicationsText = readIfExists(applicationsPath);
   const { seen, recheckEligible } = collectSeenUrls({ scanHistoryText, pipelineText, applicationsText }, policy);
-  // Companion index: the bare key of every seeded row that carried a location.
-  // It makes the wildcard rule symmetric in O(1) — see the dedupe check in
-  // main() for the direction it closes. Empty whenever the flag is off.
+  // Preserve the exported snapshot field for existing callers. The scanner's
+  // decision uses locatedRequisitionsByBase, not this legacy set.
   const seenCompanyRoleBases = new Set();
   // Keep exact/wildcard keys separate from the aggregate of located rows.
   // Only locationless candidates consult the latter.
@@ -3197,7 +3203,6 @@ async function main() {
   const dedupSnapshot = loadDedupSnapshot(historyPolicy, canonicalizeCompany, { includeLocation: dedupIncludeLocation });
   const seenUrls = dedupSnapshot.seen;
   const seenCompanyRoles = dedupSnapshot.seenCompanyRoles;
-  const seenCompanyRoleBases = dedupSnapshot.seenCompanyRoleBases ?? new Set();
   const seenCompanyRoleRequisitions = dedupSnapshot.seenCompanyRoleRequisitions ?? new Map();
   const locatedRequisitionsByBase = dedupSnapshot.locatedRequisitionsByBase ?? new Map();
 
@@ -3372,40 +3377,10 @@ async function main() {
           totalDupes++;
           continue;
         }
-        // Three lookups, not one, when the location joins the key. A bare key is
-        // a wildcard (see companyRoleDedupKey) and a wildcard has to match in
-        // BOTH directions, but the two directions are stored differently:
-        //
-        //   1. seed bare → candidate located. A source that recorded no location
-        //      (applications.md rarely has a Location column) contributed
-        //      `company::role`; a candidate keyed `company::role@@london` must
-        //      still be suppressed by it. That is the `has(baseKey)` lookup.
-        //   2. seed located → candidate bare. The reverse: history holds
-        //      `company::role@@london` and a provider now returns the same role
-        //      with its location field empty, so the candidate's own key IS
-        //      `baseKey` and matches neither stored entry. Without the third
-        //      lookup it is added as new — an already-applied role resurfacing,
-        //      which is the very thing the wildcard exists to stop.
-        //
-        // Case 2 is answered from a prebuilt index rather than by scanning
-        // seenCompanyRoles for the `${baseKey}@@` prefix: that set holds one
-        // entry per historical posting (thousands on an established install) and
-        // a prefix scan would walk all of them for every candidate of every
-        // company — O(candidates x history) added to a zero-token scan people
-        // run daily. locatedRequisitionsByBase answers it in one hash lookup.
-        //
-        // Guarded on `key === baseKey` so it fires only for a locationless
-        // candidate: two candidates with DIFFERENT cities must stay distinct.
-        // `key === baseKey` whenever the flag is off, and the index is empty in
-        // that case, so the default path is unchanged.
-        //
-        // An aggregator feed (portals.yml `aggregator: true`) names itself as
-        // the company, so two same-titled posts are two employers' jobs: only
-        // the URL dedups there, and the key is null.
-        //
-        // A key match is still not a duplicate when the employer labelled the
-        // two postings as different requisitions (isDistinctRequisition): two
-        // concurrent same-titled reqs in different departments are two jobs.
+        // Compare requisitions only in overlapping locations: the exact key,
+        // truly locationless wildcard rows, and (for a locationless candidate)
+        // the prebuilt aggregate of located rows. An unknown ID keeps the
+        // historical duplicate decision. Aggregators use URL dedup only.
         const baseKey = companyRoleDedupKey(job.company, job.title, canonicalizeCompany);
         const key = company.aggregator === true
           ? null
@@ -3434,7 +3409,6 @@ async function main() {
         seenUrls.add(dedupUrl);
         if (key !== null) {
           seenCompanyRoles.add(key);
-          if (key !== baseKey) seenCompanyRoleBases.add(baseKey);
           recordRequisition(seenCompanyRoleRequisitions, key, requisition);
           if (key !== baseKey) recordRequisition(locatedRequisitionsByBase, baseKey, requisition);
         }

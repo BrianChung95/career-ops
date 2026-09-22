@@ -21,6 +21,30 @@ assert.deepEqual(ids({text: 'JR-10423'}), ['JR-10423']);
 assert.deepEqual(ids({text: 'R_1488728'}), ['R_1488728']);
 pass('review: prefixes and punctuation distinguish IDs without breaking bare JR/R_ tokens');
 
+for (const text of ['JR 25919', 'JR:25919', 'jr: #25919', 'JR #25919']) {
+  assert.deepEqual(ids({text}), ['JR25919']);
+}
+for (const text of ['R_ 1488728', 'R_:1488728', 'r_#1488728']) {
+  assert.deepEqual(ids({text}), ['R_1488728']);
+}
+assert.deepEqual(ids({text: 'JR-25919'}), ['JR-25919']);
+assert.deepEqual(ids({text: 'JR_25919'}), ['JR_25919']);
+assert.equal(isDistinctRequisition(new Set(ids({url: lever, text: 'JR-25919'})),
+  ids({url: lever, text: 'JR25919'})), true);
+pass('review: spaced/colon JR and R_ labels retain their prefix; literal punctuation stays distinct');
+
+for (const text of ['Req #25919', 'req 25919', 'req 25919-1']) {
+  assert.deepEqual(ids({text}), []);
+  assert.equal(isDistinctRequisition(new Set(['JR25919']), ids({text})), false);
+  const requisitions = new Map();
+  collectSeenCompanyRoles({applicationsText:
+    `| Company | Role | Notes |\n|---|---|---|\n| Acme | Engineer | ${text} |\n`},
+  {}, undefined, {requisitionsByBase: requisitions});
+  assert.equal(isDistinctRequisition(requisitions.get(key('Acme', 'Engineer')), ['JR25919']), false);
+}
+assert.deepEqual(ids({url: 'https://acme.wd1.myworkdayjobs.com/jobs/job/Engineer_25919'}), ['25919']);
+pass('review: numeric-only notes cannot prove distinctness in either direction; URL IDs remain usable');
+
 const workday = 'https://acme.wd1.myworkdayjobs.com/careers/job/London/Engineer';
 assert.deepEqual(ids({url: workday, text: 'req JR25919-1'}), ['JR25919']);
 assert.equal(isDistinctRequisition(new Set(['JR25919-1']),

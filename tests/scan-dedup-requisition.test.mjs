@@ -201,6 +201,20 @@ tracked_companies:
   }
 }
 
+for (const notes of ['JR 25919; applied', 'JR:25919; applied', 'JR #25919; applied']) {
+  const { afterFirst, afterSecond } = runScanTwice(notes);
+  if (afterFirst.length === 1 && afterFirst[0].includes('_JR25853') && afterSecond.length === 1) {
+    pass(`e2e: separated label ${notes} recognises the applied Workday requisition`);
+  } else fail(`e2e separated label: ${JSON.stringify({notes, afterFirst, afterSecond})}`);
+}
+
+for (const notes of ['Req #25919; applied', 'req 25919; applied']) {
+  const { afterFirst, afterSecond } = runScanTwice(notes);
+  if (afterFirst.length === 0 && afterSecond.length === 0) {
+    pass(`e2e: ambiguous numeric note ${notes} retains conservative company/role dedup`);
+  } else fail(`e2e numeric note: ${JSON.stringify({notes, afterFirst, afterSecond})}`);
+}
+
 {
   try {
     const { afterFirst, afterSecond } = runScanTwice('req JR25919; applied');
