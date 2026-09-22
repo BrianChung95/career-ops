@@ -48,15 +48,15 @@ const trackerWith = (notes, { company = 'UBC', role = 'Programmer Analyst I' } =
 // decision never has to guess which board the note came from.
 {
   const cases = [
-    [{ url: `${WD}/Programmer-Analyst-I_JR25853` }, ['25853'], 'Workday URL tail'],
-    [{ url: `${WD}/Development-Coordinator--Library_JR25830-1` }, ['25830'], 'Workday -N repost suffix is the same requisition'],
-    [{ text: 'req JR25919; Deadline 2026-09-17' }, ['25919'], 'labelled tracker note'],
-    [{ text: 'JR25919 one-year term' }, ['25919'], 'bare JR label'],
-    [{ text: 'req JR25919-1; applied' }, ['259191', '25919'], 'no URL: a copied -N tail yields both forms, so it still meets the Workday URL (PR #4267 review)'],
-    [{ text: 'req ABC123-1' }, ['1231', '123'], 'no URL: a short -N suffix yields both forms, so it still meets a Lever title (PR #4267 review)'],
-    [{ text: 'req ABC123-1', url: 'https://jobs.lever.co/acme/a1' }, ['1231'], 'known non-Workday URL keeps the -N suffix (it is part of the ID)'],
-    [{ text: 'req ABC123-2', url: 'https://jobs.lever.co/acme/a2' }, ['1232'], 'known non-Workday URL: the sibling ID stays distinct'],
-    [{ text: 'req R-2593225' }, ['2593225'], 'hyphenated non-Workday ID is one form even without a URL'],
+    [{ url: `${WD}/Programmer-Analyst-I_JR25853` }, ['JR25853'], 'Workday URL tail'],
+    [{ url: `${WD}/Development-Coordinator--Library_JR25830-1` }, ['JR25830'], 'Workday -N repost suffix is the same requisition'],
+    [{ text: 'req JR25919; Deadline 2026-09-17' }, ['JR25919'], 'labelled tracker note'],
+    [{ text: 'JR25919 one-year term' }, ['JR25919'], 'bare JR label'],
+    [{ text: 'req JR25919-1; applied' }, ['JR25919-1', 'JR25919'], 'no URL: a copied -N tail yields both forms, so it still meets the Workday URL (PR #4267 review)'],
+    [{ text: 'req ABC123-1' }, ['ABC123-1', 'ABC123'], 'no URL: a short -N suffix yields both forms, so it still meets a Lever title (PR #4267 review)'],
+    [{ text: 'req ABC123-1', url: 'https://jobs.lever.co/acme/a1' }, ['ABC123-1'], 'known non-Workday URL keeps the -N suffix (it is part of the ID)'],
+    [{ text: 'req ABC123-2', url: 'https://jobs.lever.co/acme/a2' }, ['ABC123-2'], 'known non-Workday URL: the sibling ID stays distinct'],
+    [{ text: 'req R-2593225' }, ['R-2593225'], 'hyphenated non-Workday ID is one form even without a URL'],
     [{ url: 'https://careers.walmart.com/us/en/job/R-2593225' }, [], 'non-Workday URL is not parsed as a requisition'],
     [{ url: 'https://job-boards.greenhouse.io/acme/jobs/4244715009' }, [], 'generic board posting id is not a requisition'],
     [{ text: 'remote Canada; base CAD 140K' }, [], 'unlabelled note'],
@@ -67,23 +67,23 @@ const trackerWith = (notes, { company = 'UBC', role = 'Programmer Analyst I' } =
     else fail(`requisitionIdsForDedup: ${label} — got ${JSON.stringify(got)}, want ${JSON.stringify(want)}`);
   }
   const single = requisitionIdForDedup({ text: 'req JR25919-1' });
-  if (single === '259191') pass('requisitionIdForDedup: returns the as-labelled form first');
-  else fail(`requisitionIdForDedup: got ${JSON.stringify(single)}, want "259191"`);
+  if (single === 'JR25919-1') pass('requisitionIdForDedup: returns the as-labelled form first');
+  else fail(`requisitionIdForDedup: got ${JSON.stringify(single)}, want "JR25919-1"`);
 }
 
 // ── 2. Decision is conservative ──────────────────────────────────────────────
 {
   const checks = [
-    [new Set(['25919']), ['25853'], true, 'different labelled requisition is distinct'],
-    [new Set(['1231']), ['1232'], true, 'non-Workday ABC123-1 vs ABC123-2 stay distinct requisitions'],
-    [new Set(['25919']), ['25919'], false, 'same requisition is a duplicate'],
-    [new Set(['259191', '25919']), ['25919'], false, 'ambiguous note seeded both forms: the Workday URL form hits one'],
-    [new Set(['1231', '123']), ['1231'], false, 'ambiguous note seeded both forms: the Lever title form hits one'],
-    [new Set(['1231', '123']), ['1232'], true, 'ambiguous note seeded both forms: the Lever sibling hits neither'],
-    [new Set(['25919']), '25919', false, 'a bare string candidate is still accepted'],
-    [new Set(['25919', ANY_REQUISITION]), '25853', false, 'an unlabelled seed keeps the duplicate'],
-    [new Set(['25919']), null, false, 'an unlabelled candidate keeps the duplicate'],
-    [undefined, '25853', false, 'no seed data keeps the duplicate'],
+    [new Set(['JR25919']), ['JR25853'], true, 'different labelled requisition is distinct'],
+    [new Set(['ABC123-1']), ['ABC123-2'], true, 'non-Workday ABC123-1 vs ABC123-2 stay distinct requisitions'],
+    [new Set(['JR25919']), ['JR25919'], false, 'same requisition is a duplicate'],
+    [new Set(['JR25919-1', 'JR25919']), ['JR25919'], false, 'ambiguous note seeded both forms: the Workday URL form hits one'],
+    [new Set(['ABC123-1', 'ABC123']), ['ABC123-1'], false, 'ambiguous note seeded both forms: the Lever title form hits one'],
+    [new Set(['ABC123-1', 'ABC123']), ['ABC123-2'], true, 'ambiguous note seeded both forms: the Lever sibling hits neither'],
+    [new Set(['JR25919']), 'JR25919', false, 'a bare string candidate is still accepted'],
+    [new Set(['JR25919', ANY_REQUISITION]), 'JR25853', false, 'an unlabelled seed keeps the duplicate'],
+    [new Set(['JR25919']), null, false, 'an unlabelled candidate keeps the duplicate'],
+    [undefined, 'JR25853', false, 'no seed data keeps the duplicate'],
   ];
   for (const [seeded, candidate, want, label] of checks) {
     if (isDistinctRequisition(seeded, candidate) === want) pass(`isDistinctRequisition: ${label}`);
@@ -102,10 +102,10 @@ const trackerWith = (notes, { company = 'UBC', role = 'Programmer Analyst I' } =
   const seeded = requisitionsByBase.get(companyRoleDedupKey('UBC', 'Programmer Analyst I'));
   // The note has no -N suffix, so it contributes one form — the same one the
   // two URLs contribute.
-  if (seeded && seeded.size === 1 && seeded.has('25919')) {
+  if (seeded && seeded.size === 1 && seeded.has('JR25919')) {
     pass('collectSeenCompanyRoles: tracker note, pipeline URL and scan-history URL all seed the same requisition');
   } else {
-    fail(`collectSeenCompanyRoles seeded [${seeded ? [...seeded].join(', ') : 'nothing'}], want [25919]`);
+    fail(`collectSeenCompanyRoles seeded [${seeded ? [...seeded].join(', ') : 'nothing'}], want [JR25919]`);
   }
 }
 
@@ -121,10 +121,10 @@ const trackerWith = (notes, { company = 'UBC', role = 'Programmer Analyst I' } =
 `,
   }, {}, undefined, { requisitionsByBase });
   const seeded = requisitionsByBase.get(companyRoleDedupKey('Acme', 'Engineer'));
-  if (seeded && seeded.size === 1 && seeded.has('1231')) {
+  if (seeded && seeded.size === 1 && seeded.has('ABC123-1')) {
     pass('collectSeenCompanyRoles: a tracker URL column reaches the parser, so a Lever row keeps ABC123-1 whole');
   } else {
-    fail(`collectSeenCompanyRoles (URL column) seeded [${seeded ? [...seeded].join(', ') : 'nothing'}], want [1231]`);
+    fail(`collectSeenCompanyRoles (URL column) seeded [${seeded ? [...seeded].join(', ') : 'nothing'}], want [ABC123-1]`);
   }
 }
 
@@ -138,11 +138,22 @@ const LEVER_BOARD = {
   careersUrl: 'https://jobs.lever.co/acme', script: 'tests/fixtures/lever-suffixed-requisitions-board.mjs',
 };
 
+const LOCATION_BOARD = {
+  company: 'Acme', role: 'Engineer', titleFilter: 'Engineer',
+  careersUrl: 'https://acme.wd1.myworkdayjobs.com/careers',
+  script: 'tests/fixtures/location-requisition-board.mjs',
+  history: `url\tfirst_seen\tportal\ttitle\tcompany\tstatus\tlocation
+https://acme.wd1.myworkdayjobs.com/careers/job/London/Engineer_JR100\t2026-09-22\tAcme\tEngineer\tAcme\tadded\tLondon
+https://acme.wd1.myworkdayjobs.com/careers/job/New-York/Engineer_JR200\t2026-09-22\tAcme\tEngineer\tAcme\tadded\tNew York
+`,
+};
+
 function runScanTwice(trackerNotes, board = UBC_BOARD) {
   const dir = mkdtempSync(join(tmpdir(), 'scan-reqdedup-e2e-'));
   try {
     mkdirSync(join(dir, 'data'), { recursive: true });
-    writeFileSync(join(dir, 'data', 'applications.md'), trackerWith(trackerNotes, board));
+    writeFileSync(join(dir, 'data', 'applications.md'), board.history ? '' : trackerWith(trackerNotes, board));
+    if (board.history) writeFileSync(join(dir, 'data', 'scan-history.tsv'), board.history);
     writeFileSync(join(dir, 'data', 'pipeline.md'), '# Pipeline\n\n');
 
     const portals = join(dir, 'portals.yml');
@@ -182,6 +193,15 @@ tracked_companies:
 }
 
 {
+  const { afterFirst, afterSecond } = runScanTwice('', LOCATION_BOARD);
+  if (afterFirst.length === 1 && afterFirst[0].includes('/London/Engineer_JR200') && afterSecond.length === 1) {
+    pass('e2e: a requisition seen only in New York does not suppress London; second scan adds nothing');
+  } else {
+    fail(`e2e location requisitions: ${JSON.stringify({afterFirst, afterSecond})}`);
+  }
+}
+
+{
   try {
     const { afterFirst, afterSecond } = runScanTwice('req JR25919; applied');
     if (afterFirst.length === 1 && afterFirst[0].includes('_JR25853') && afterSecond.length === 1) {
@@ -213,7 +233,7 @@ tracked_companies:
 {
   // The other half of the same ambiguity, on a board where the -N suffix is
   // part of the ID. The tracker note names `req ABC123-1` with no URL column;
-  // the Lever posting's own form is `1231`. Guessing the Workday reading
+  // the Lever posting's own form is `ABC123-1`. Guessing the Workday reading
   // (`123`) for the note made the applied posting look distinct and re-queued
   // it; carrying both forms recognises it, and only ABC123-2 is queued.
   try {

@@ -64,7 +64,7 @@ import { loadProviders, resolveProvider } from './providers/_registry.mjs';
 import { mergeProviderPlugins } from './plugins/_engine.mjs';
 import { classifyFetchError } from './verify-portals.mjs';
 import { fingerprintText, findCrossListings } from './fingerprint-core.mjs';
-import { resolveColumns, parseTrackerRow, normalizeTextKey, extractReqNumber } from './tracker-parse.mjs';
+import { resolveColumns, parseTrackerRow, normalizeTextKey, extractReqNumber, REQ_NUMBER_RE } from './tracker-parse.mjs';
 import { workdayDedupKey, stripWorkdayRepostSuffix, isWorkdayJobUrl } from './providers/workday.mjs';
 import { normalizeCompany } from './tracker-utils.mjs';
 import { normalizeCompanyName } from './invite-match.mjs';
@@ -2031,18 +2031,17 @@ export const ANY_REQUISITION = '*';
  *   seen, so the ambiguous note matches whichever board the posting turns out
  *   to live on: note `req JR25919-1` recognises Workday `_JR25919`, and note
  *   `req ABC123-1` recognises a Lever title carrying `req ABC123-1` (whose
- *   own single form is `1231`, not `123`), so neither applied posting is
- *   re-queued. Guessing one form was wrong in both directions: stripping
- *   collapsed `123` against Lever's `1231` (re-queued), keeping it left
- *   `259191` against Workday's `25919` (also re-queued).
+ *   own single form is `ABC123-1`), so neither applied posting is re-queued.
+ *   Guessing one form was wrong in both directions: stripping changed the
+ *   Lever ID, while keeping only the suffix-bearing form missed Workday.
  *
  * The suffix rule (`stripWorkdayRepostSuffix`) only fires when the part before
  * the hyphen is already requisition-shaped, so Walmart's `R-2593225` is one
  * form on every path.
  *
- * Every form is uppercased, stripped of punctuation and of a leading letter
- * prefix, so `req JR25919` in a note, a bare `JR25919` (whose `jr` is itself the
- * label) and the URL tail `_JR25919` all compare equal.
+ * Comparison ignores case only: prefixes and punctuation identify distinct
+ * requisitions. Bare JR/R_ tokens retain the prefix consumed as a label by
+ * the shared tracker parser.
  *
  * @param {{url?: unknown, text?: unknown}} [source] - Posting URL and/or free text.
  * @returns {string[]} Canonical requisition IDs, as-labelled form first.
@@ -2055,15 +2054,19 @@ export function requisitionIdsForDedup({ url, text } = {}) {
     // everything after the second one.
     raws = [workdayKey.split(':').slice(2).join(':')];
   } else {
-    const labelled = extractReqNumber(text);
+    const match = String(text ?? '').match(REQ_NUMBER_RE);
+    const labelled = match && /^(?:JR-?|R_)\d/i.test(match[0])
+      ? match[0].toUpperCase()
+      : extractReqNumber(text);
     if (!labelled) return [];
-    raws = isWorkdayJobUrl(url) === false
-      ? [labelled]
-      : [labelled, stripWorkdayRepostSuffix(labelled)];
+    const workdayUrl = isWorkdayJobUrl(url);
+    raws = workdayUrl === true
+      ? [stripWorkdayRepostSuffix(labelled)]
+      : workdayUrl === false ? [labelled] : [labelled, stripWorkdayRepostSuffix(labelled)];
   }
   const forms = [];
   for (const raw of raws) {
-    const id = String(raw ?? '').toUpperCase().replace(/[^A-Z0-9]/g, '').replace(/^[A-Z]+(?=\d)/, '');
+    const id = String(raw ?? '').toUpperCase();
     if (/\d/.test(id) && !forms.includes(id)) forms.push(id);
   }
   return forms;
@@ -2092,7 +2095,7 @@ export function requisitionIdForDedup(source) {
  * every form it could mean (see {@link requisitionIdsForDedup}), and one hit
  * on any of them is a duplicate.
  *
- * @param {Set<string>|undefined} seededRequisitions - Requisitions seen for the bare key.
+ * @param {Set<string>|undefined} seededRequisitions - Requisitions seen for matching keys.
  * @param {string[]|string|null} candidateRequisitions - From {@link requisitionIdsForDedup}.
  * @returns {boolean}
  */
@@ -2108,6 +2111,19 @@ export function isDistinctRequisition(seededRequisitions, candidateRequisitions)
 function toRequisitionForms(requisitions) {
   if (Array.isArray(requisitions)) return requisitions.filter(Boolean);
   return requisitions ? [requisitions] : [];
+}
+
+/** Match only the requisition sets belonging to keys that match this location.
+ * A locationless candidate overlaps every located row, but a located candidate
+ * overlaps only its exact key and genuinely locationless wildcard rows.
+ */
+export function matchesSeenCompanyRole({ key, baseKey, seen, requisitions, locatedRequisitions }, candidate) {
+  if (key === null) return false;
+  if (seen.has(key) && !isDistinctRequisition(requisitions.get(key), candidate)) return true;
+  if (key !== baseKey && seen.has(baseKey)
+    && !isDistinctRequisition(requisitions.get(baseKey), candidate)) return true;
+  return key === baseKey && locatedRequisitions.has(baseKey)
+    && !isDistinctRequisition(locatedRequisitions.get(baseKey), candidate);
 }
 
 function recordRequisition(requisitionsByBase, baseKey, requisitions) {
@@ -2157,12 +2173,14 @@ function recordRequisition(requisitionsByBase, baseKey, requisitions) {
  *   byte for byte. `locatedBases`, when a Set is supplied, additionally collects
  *   the BARE key of every row that seeded a located one — see
  *   {@link loadDedupSnapshot} for what reads it. `requisitionsByBase`, when a Map
- *   is supplied, collects every requisition seen per BARE key (or
+ *   is supplied, collects every requisition seen per actual dedup key (or
  *   {@link ANY_REQUISITION} for a row that named none) — see
- *   {@link isDistinctRequisition}.
+ *   {@link isDistinctRequisition}. `locatedRequisitionsByBase` separately
+ *   aggregates located rows for matching a locationless candidate; it never
+ *   acts as a bare wildcard against a located candidate.
  * @returns {Set<string>} Existing company+role dedupe keys.
  */
-export function collectSeenCompanyRoles(sources = {}, policy = {}, canonicalize = defaultCompanyNormalizer, { includeLocation = false, locatedBases = null, requisitionsByBase = null } = {}) {
+export function collectSeenCompanyRoles(sources = {}, policy = {}, canonicalize = defaultCompanyNormalizer, { includeLocation = false, locatedBases = null, requisitionsByBase = null, locatedRequisitionsByBase = null } = {}) {
   const { applicationsText = '', scanHistoryText = '', pipelineText = '' } = sources;
   const seen = new Set();
   const add = (company, role, location, requisition = null) => {
@@ -2185,7 +2203,11 @@ export function collectSeenCompanyRoles(sources = {}, policy = {}, canonicalize 
       if (key !== base) locatedBases.add(base);
     }
     if (requisitionsByBase) {
-      recordRequisition(requisitionsByBase, companyRoleDedupKey(c, r, canonicalize), requisition);
+      recordRequisition(requisitionsByBase, key, requisition);
+    }
+    const base = companyRoleDedupKey(c, r, canonicalize);
+    if (locatedRequisitionsByBase && key !== base) {
+      recordRequisition(locatedRequisitionsByBase, base, requisition);
     }
   };
 
@@ -2500,12 +2522,13 @@ export function loadDedupSnapshot(policy = {}, canonicalize = defaultCompanyNorm
   // It makes the wildcard rule symmetric in O(1) — see the dedupe check in
   // main() for the direction it closes. Empty whenever the flag is off.
   const seenCompanyRoleBases = new Set();
-  // Requisitions seen per bare key, so a same-titled posting the employer
-  // labelled as a different requisition is not dropped (see isDistinctRequisition).
+  // Keep exact/wildcard keys separate from the aggregate of located rows.
+  // Only locationless candidates consult the latter.
   const seenCompanyRoleRequisitions = new Map();
-  const seenCompanyRoles = collectSeenCompanyRoles({ applicationsText, scanHistoryText, pipelineText }, policy, canonicalize, { includeLocation, locatedBases: seenCompanyRoleBases, requisitionsByBase: seenCompanyRoleRequisitions });
+  const locatedRequisitionsByBase = new Map();
+  const seenCompanyRoles = collectSeenCompanyRoles({ applicationsText, scanHistoryText, pipelineText }, policy, canonicalize, { includeLocation, locatedBases: seenCompanyRoleBases, requisitionsByBase: seenCompanyRoleRequisitions, locatedRequisitionsByBase });
   const fingerprintHistory = collectFingerprintHistory(scanHistoryText);
-  return { seen, recheckEligible, seenCompanyRoles, seenCompanyRoleBases, seenCompanyRoleRequisitions, fingerprintHistory };
+  return { seen, recheckEligible, seenCompanyRoles, seenCompanyRoleBases, seenCompanyRoleRequisitions, locatedRequisitionsByBase, fingerprintHistory };
 }
 
 // Standard skeleton created on fresh install — matches the format documented
@@ -3176,6 +3199,7 @@ async function main() {
   const seenCompanyRoles = dedupSnapshot.seenCompanyRoles;
   const seenCompanyRoleBases = dedupSnapshot.seenCompanyRoleBases ?? new Set();
   const seenCompanyRoleRequisitions = dedupSnapshot.seenCompanyRoleRequisitions ?? new Map();
+  const locatedRequisitionsByBase = dedupSnapshot.locatedRequisitionsByBase ?? new Map();
 
   // 5. Fetch from each target
   // LOCAL day. This one value does two things that both care which day it is:
@@ -3368,7 +3392,7 @@ async function main() {
         // entry per historical posting (thousands on an established install) and
         // a prefix scan would walk all of them for every candidate of every
         // company — O(candidates x history) added to a zero-token scan people
-        // run daily. seenCompanyRoleBases answers it in one hash lookup.
+        // run daily. locatedRequisitionsByBase answers it in one hash lookup.
         //
         // Guarded on `key === baseKey` so it fires only for a locationless
         // candidate: two candidates with DIFFERENT cities must stay distinct.
@@ -3389,14 +3413,8 @@ async function main() {
             ? companyRoleDedupKey(job.company, job.title, canonicalizeCompany, job.location)
             : baseKey);
         const requisition = requisitionIdsForDedup({ url: job.url, text: job.title });
-        if (
-          key !== null && (
-            seenCompanyRoles.has(key) ||
-            seenCompanyRoles.has(baseKey) ||
-            (key === baseKey && seenCompanyRoleBases.has(baseKey))
-          ) &&
-          !isDistinctRequisition(seenCompanyRoleRequisitions.get(baseKey), requisition)
-        ) {
+        if (matchesSeenCompanyRole({ key, baseKey, seen: seenCompanyRoles,
+          requisitions: seenCompanyRoleRequisitions, locatedRequisitions: locatedRequisitionsByBase }, requisition)) {
           totalDupes++;
           continue;
         }
@@ -3417,7 +3435,8 @@ async function main() {
         if (key !== null) {
           seenCompanyRoles.add(key);
           if (key !== baseKey) seenCompanyRoleBases.add(baseKey);
-          recordRequisition(seenCompanyRoleRequisitions, baseKey, requisition);
+          recordRequisition(seenCompanyRoleRequisitions, key, requisition);
+          if (key !== baseKey) recordRequisition(locatedRequisitionsByBase, baseKey, requisition);
         }
         // Tag with the company's careers domain so verify can offer a 404/410
         // rediscovery fallback. A null domain (no careers_url) marks the offer
