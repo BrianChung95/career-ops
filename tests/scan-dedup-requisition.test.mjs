@@ -27,6 +27,7 @@ import {
   collectSeenCompanyRoles,
   companyRoleDedupKey,
   isDistinctRequisition,
+  matchesSeenCompanyRole,
   requisitionIdForDedup,
   requisitionIdsForDedup,
 } from '../scan.mjs';
@@ -272,5 +273,110 @@ for (const notes of ['Req #25919; applied', 'req 25919; applied']) {
     }
   } catch (err) {
     fail(`e2e scan run (unlabelled tracker) failed: ${err.message}`);
+  }
+}
+
+
+// ── 5. Review regressions (PR #4267, second round) ───────────────────────────
+// Each block pins one finding from the review of the both-forms parser.
+{
+  const eq = (label, actual, expected) => {
+    const a = JSON.stringify(actual);
+    const e = JSON.stringify(expected);
+    if (a === e) pass(label);
+    else fail(`${label} — expected ${e}, got ${a}`);
+  };
+  const ids = requisitionIdsForDedup;
+  const lever = 'https://jobs.lever.co/acme/a1';
+
+  // 5a. Prefixes and punctuation identify a requisition. Stripping the
+  // leading letters made ABC123-1 and XYZ123-1 both read 1231, so one seeded
+  // requisition suppressed the other.
+  for (const [a, b] of [['ABC123-1', 'XYZ123-1'], ['ABC123-1', 'ABC1231']]) {
+    eq(`prefix kept: ${a} and ${b} on a non-Workday board are distinct`,
+      isDistinctRequisition(new Set(ids({ url: lever, text: `req ${a}` })), ids({ url: lever, text: `req ${b}` })), true);
+  }
+  eq('prefix kept: comparison ignores case only', ids({ url: lever, text: 'req abc123-1' }), ['ABC123-1']);
+  eq('prefix kept: bare JR token keeps the prefix the label consumed', ids({ text: 'JR25919' }), ['JR25919']);
+  eq('prefix kept: glued JR-10423 is literal', ids({ text: 'JR-10423' }), ['JR-10423']);
+  eq('prefix kept: bare R_ token keeps its prefix', ids({ text: 'R_1488728' }), ['R_1488728']);
+
+  // 5b. A separated label (`JR 25919`, `JR:25919`) is the same requisition as
+  // the URL tail `_JR25919`; glued punctuation (`JR-25919`) is part of the ID.
+  for (const text of ['JR 25919', 'JR:25919', 'jr: #25919', 'JR #25919']) {
+    eq(`separated label: "${text}" re-attaches JR`, ids({ text }), ['JR25919']);
+  }
+  for (const text of ['R_ 1488728', 'R_:1488728', 'r_#1488728']) {
+    eq(`separated label: "${text}" re-attaches R_`, ids({ text }), ['R_1488728']);
+  }
+  eq('separated label: glued JR-25919 stays literal', ids({ text: 'JR-25919' }), ['JR-25919']);
+  eq('separated label: glued JR_25919 stays literal', ids({ text: 'JR_25919' }), ['JR_25919']);
+  eq('separated label: literal JR-25919 and JR25919 stay distinct on a non-Workday board',
+    isDistinctRequisition(new Set(ids({ url: lever, text: 'JR-25919' })), ids({ url: lever, text: 'JR25919' })), true);
+
+  // 5c. Numeric-only text (`Req #25919`) may have dropped a prefix, so it is
+  // no proof of a distinct requisition in either direction: as a candidate it
+  // yields no form, as a seed it records the wildcard. A numeric Workday URL
+  // tail is still usable — the URL is authoritative.
+  for (const text of ['Req #25919', 'req 25919', 'req 25919-1']) {
+    eq(`numeric-only note: "${text}" yields no form`, ids({ text }), []);
+    eq(`numeric-only note: "${text}" as a candidate is never distinct`,
+      isDistinctRequisition(new Set(['JR25919']), ids({ text })), false);
+    const requisitions = new Map();
+    collectSeenCompanyRoles({
+      applicationsText: `| Company | Role | Notes |\n|---|---|---|\n| Acme | Engineer | ${text} |\n`,
+    }, {}, undefined, { requisitionsByBase: requisitions });
+    eq(`numeric-only note: "${text}" as a seed keeps every same-titled posting a duplicate`,
+      isDistinctRequisition(requisitions.get(companyRoleDedupKey('Acme', 'Engineer')), ['JR25919']), false);
+  }
+  eq('numeric Workday URL tail is still a form', ids({ url: 'https://acme.wd1.myworkdayjobs.com/jobs/job/Engineer_25919' }), ['25919']);
+
+  // 5d. A known Workday URL whose last segment has no underscore yields no
+  // URL form; the labelled text must then use ONLY the stripped form, or a
+  // non-Workday JR25919-1 seen earlier could suppress the Workday candidate
+  // through the unstripped one.
+  const workday = 'https://acme.wd1.myworkdayjobs.com/careers/job/London/Engineer';
+  eq('known Workday URL without an underscore: only the stripped text form', ids({ url: workday, text: 'req JR25919-1' }), ['JR25919']);
+  eq('known Workday URL without an underscore: a seeded literal JR25919-1 does not suppress it',
+    isDistinctRequisition(new Set(['JR25919-1']), ids({ url: workday, text: 'req JR25919-1' })), true);
+  eq('no URL: both forms, as before', ids({ text: 'req JR25919-1' }), ['JR25919-1', 'JR25919']);
+
+  // 5e. Requisitions are recorded under the key that matched, so a
+  // requisition seen only in New York cannot suppress a new London opening,
+  // while a locationless candidate still meets the aggregate of located rows
+  // and a locationless wildcard row still meets every located candidate.
+  const history = `url\tfirst_seen\tportal\ttitle\tcompany\tstatus\tlocation
+${workday}_JR100\t2026-09-22\tAcme\tEngineer\tAcme\tadded\tLondon
+${workday.replace('London', 'New-York')}_JR200\t2026-09-22\tAcme\tEngineer\tAcme\tadded\tNew York
+`;
+  for (const includeLocation of [true, false]) {
+    const tag = includeLocation ? 'located keys' : 'bare keys';
+    const requisitions = new Map();
+    const locatedRequisitions = new Map();
+    const seen = collectSeenCompanyRoles({ scanHistoryText: history }, {}, undefined, {
+      includeLocation, requisitionsByBase: requisitions, locatedRequisitionsByBase: locatedRequisitions,
+    });
+    const baseKey = companyRoleDedupKey('Acme', 'Engineer');
+    const matches = (location, candidate) => matchesSeenCompanyRole({
+      key: companyRoleDedupKey('Acme', 'Engineer', undefined, includeLocation ? location : undefined),
+      baseKey, seen, requisitions, locatedRequisitions,
+    }, candidate);
+    eq(`${tag}: London JR200 is a duplicate only when locations are not part of the key`, matches('London', ['JR200']), !includeLocation);
+    eq(`${tag}: London JR100 is a duplicate`, matches('London', ['JR100']), true);
+    eq(`${tag}: a locationless JR200 candidate meets the located row`, matches(undefined, ['JR200']), true);
+    eq(`${tag}: a locationless JR300 candidate is distinct`, matches(undefined, ['JR300']), false);
+    if (includeLocation) {
+      eq('located keys: nothing is recorded under the bare key', requisitions.has(baseKey), false);
+      eq('located keys: an unseen city with no requisition is not a duplicate', matches('Paris', []), false);
+      requisitions.get(companyRoleDedupKey('Acme', 'Engineer', undefined, 'New York')).add(ANY_REQUISITION);
+      locatedRequisitions.get(baseKey).add(ANY_REQUISITION);
+      eq('located keys: an unlabelled New York row does not poison London', matches('London', ['JR200']), false);
+      eq('located keys: an unlabelled located row does catch a locationless candidate', matches(undefined, ['JR300']), true);
+      seen.add(baseKey);
+      requisitions.set(baseKey, new Set(['JR200']));
+      eq('located keys: a locationless JR200 wildcard row catches London JR200', matches('London', ['JR200']), true);
+      requisitions.set(baseKey, new Set([ANY_REQUISITION]));
+      eq('located keys: an unlabelled locationless row catches every city', matches('Paris', ['JR300']), true);
+    }
   }
 }
